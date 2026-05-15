@@ -1,0 +1,99 @@
+name: Deploy DistilBERT to Hugging Face Spaces
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  DOCKER_REPO: 03sarath/distilbert-sentiment
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # JOB 1: Lint and test the application code
+  # ─────────────────────────────────────────────
+  validate:
+    name: Validate Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: pip install pytest fastapi httpx pydantic
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Read version from hf-space/Dockerfile and verify it exists on Docker Hub
+  # ─────────────────────────────────────────────
+  check-image:
+    name: Verify Docker Hub Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.read-tag.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read image tag from hf-space/Dockerfile
+        id: read-tag
+        run: |
+          TAG=$(grep '^FROM' hf-space/Dockerfile | awk -F: '{print $2}')
+          echo "Deploying image tag: $TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Check image exists on Docker Hub
+        run: docker manifest inspect ${{ env.DOCKER_REPO }}:${{ steps.read-tag.outputs.tag }}
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Deploy to Hugging Face Spaces
+  # Runs only after validate and check-image pass
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to Hugging Face Spaces
+    runs-on: ubuntu-latest
+    needs: [validate, check-image]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Upload to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          pip install huggingface_hub -q
+          huggingface-cli upload-folder \
+            --repo-id ${{ secrets.HF_USERNAME }}/${{ secrets.HF_SPACE_NAME }} \
+            --repo-type space \
+            --token $HF_TOKEN \
+            hf-space/
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Confirm the deployment is live
+  # ─────────────────────────────────────────────
+  health-check:
+    name: Post-Deploy Health Check
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Wait for Space to rebuild
+        run: sleep 90
+
+      - name: Call health endpoint and confirm version
+        env:
+          HF_USERNAME: ${{ secrets.HF_USERNAME }}
+          HF_SPACE_NAME: ${{ secrets.HF_SPACE_NAME }}
+        run: |
+          curl --fail \
+               --retry 5 \
+               --retry-delay 30 \
+               --retry-connrefused \
+               https://$HF_USERNAME-$HF_SPACE_NAME.hf.space/health
